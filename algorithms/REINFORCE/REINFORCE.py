@@ -1,3 +1,4 @@
+# Paper: https://arxiv.org/pdf/1604.06778.pdf
 # Got the basic idea from https://github.com/pytorch/examples/blob/master/reinforcement_learning/reinforce.py
 # Solving Cartpole-v1 with 472 episodes
 import gym
