@@ -1,23 +1,24 @@
 # Paper: https://arxiv.org/pdf/1604.06778.pdf
-# Got the basic idea from https://github.com/pytorch/examples/blob/master/reinforcement_learning/reinforce.py
-# Solving Cartpole-v1 with 472 episodes
+# Compared with REINFORCE.py, we add baselines for REINFORCE algorithms
+# Got the basic idea from https://github.com/pytorch/examples/blob/master/reinforcement_learning/actor_critic.py
+# Solving Cartpole-v1 with 507 episodes
 import os
-
 import gym
+import numpy as np
 from itertools import count
+from collections import namedtuple
 
 import torch
+from torch import optim
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import optim
 from torch.distributions import Categorical
-import numpy as np
 from torch.utils.tensorboard import SummaryWriter
-
 
 from algorithms.REINFORCE.config import arg_parser
 
 EPS = np.finfo(np.float32).eps.item()
+SavedACValue = namedtuple('SavedACValue', ['log_prob', 'critic_value'])
 
 
 class Policy(nn.Module):
@@ -26,32 +27,41 @@ class Policy(nn.Module):
         assert obs_shape > 0 and act_shape > 0
 
         self.layer_1 = nn.Linear(obs_shape, 128)
-        self.drop_out_1 = nn.Dropout(p=0.6)
-        self.layer_2 = nn.Linear(128, act_shape)
+
+        self.actor_head = nn.Linear(128, act_shape)
+        self.critic_head = nn.Linear(128, 1)
 
         self.rewards = []
-        self.log_prob = []
+        self.saved_ac_value = []
 
     def forward(self, obs):
         x = self.layer_1(obs)
-        x = self.drop_out_1(x)
         x = F.relu(x)
-        act_prob = self.layer_2(x)
-        act_prob = F.softmax(act_prob, dim=1)
-        return act_prob
+
+        act_prob = self.actor_head(x)
+        act_prob = F.softmax(act_prob, dim=-1)
+
+        critic_value = self.critic_head(x)
+
+        # act_prob: the probability of actions
+        # critic_value: b(s_t), evaluate the value of state s_t
+        return act_prob, critic_value
 
 
 def select_action(obs, policy):
     # 1. change numpy,array to tensor, 2. ensure it is float, 3. unsqueeze, since nn.Module can only deal with
     # mini-batch, wich means even we only have one observation, we still need to unsqueeze it. change from CHW -> BCHW
+
+    # obs = torch.from_numpy(obs).float().unsqueeze(dim=0)
     obs = torch.from_numpy(obs).float().unsqueeze(dim=0)
-    act_prob = policy(obs)
+
+    act_prob, critic_value = policy(obs)
 
     # https://pytorch.org/docs/stable/distributions.html
     # Categorical has sample() and log_prob()
     m = Categorical(act_prob)
     action = m.sample()
-    policy.log_prob.append(m.log_prob(action))
+    policy.saved_ac_value.append(SavedACValue(m.log_prob(action), critic_value))
 
     return action.item()
 
@@ -60,18 +70,23 @@ def update_policy(cfg, policy, optimizer):
     R = 0
     rewards = []
     policy_loss = []
+    value_loss = []
 
     # Calculate reward from end -> start
     for r in policy.rewards[::-1]:
         R = r + cfg.gamma * R
         rewards.insert(0, R)
 
-    rewards = np.array(rewards)
+    # ** This is important, without this
+    rewards = torch.tensor(rewards)
     rewards = (rewards - rewards.mean()) / (rewards.std() + EPS)
     # Max E(R(T)) = Max R( R_t * prob(a_t) )
     # == Min - E(R(T)) = Min - R( R_t * prob(a_t) )
-    for R, log_prob in zip(rewards, policy.log_prob):
-        policy_loss.append(-R * log_prob)
+    for R, (log_prob, critic_value) in zip(rewards, policy.saved_ac_value):
+        advantage = R - critic_value.item()
+
+        policy_loss.append(-log_prob * advantage)
+        value_loss.append(F.smooth_l1_loss(critic_value, torch.tensor([[R]])))
 
     # Basic idea: https://pytorch.org/docs/stable/optim.html
     # Explain backward() and step()
@@ -81,11 +96,13 @@ def update_policy(cfg, policy, optimizer):
     # call backward() on the loss.
 
     optimizer.zero_grad()
-    policy_loss = torch.cat(policy_loss).sum()
-    policy_loss.backward()
+    # policy_loss = torch.cat(policy_loss).sum()
+    loss = torch.stack(policy_loss).sum() + torch.stack(value_loss).sum()
+    loss.backward()
     optimizer.step()
+
     del policy.rewards[:]
-    del policy.log_prob[:]
+    del policy.saved_ac_value[:]
 
 
 def enjoy(cfg):
@@ -145,7 +162,9 @@ def main(cfg=None):
 
             if done:
                 framestep_count += i
-                writer.add_scalar('reward', episode_reward, framestep_count)
+                writer.add_scalar('reward',
+                                  episode_reward,
+                                  framestep_count)
                 episode_rewards.append(episode_reward)
                 break
 
@@ -155,6 +174,7 @@ def main(cfg=None):
         last_episodes = episode_rewards[-100:]
         avg_reward = sum(last_episodes) / len(last_episodes)
         writer.add_scalar('avg_reward', avg_reward, framestep_count)
+
         if episode_id % cfg.log_interval == 0:
             print('episode_id:  ', episode_id, '    avg_reward:  ', avg_reward)
         if avg_reward >= env.spec.reward_threshold:
